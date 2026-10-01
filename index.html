@@ -91,6 +91,14 @@ input[type=range]{width:100%;accent-color:var(--amber);margin:0;height:28px}
 .recording .recbtn i{width:28px;height:28px;border-radius:6px}
 .row{display:flex;gap:8px;align-items:center}
 @media (prefers-reduced-motion:reduce){.recbtn i{transition:none}}
+.text{position:relative}
+.text .r{color:var(--dim);text-shadow:none}
+.heard{position:absolute;left:12px;bottom:10px;max-width:55%;font-size:.75rem;color:var(--dim);white-space:nowrap;overflow:hidden;pointer-events:none}
+.mic{display:none;align-items:center;gap:5px;color:var(--paper)}
+.following .mic{display:inline-flex}
+.following .speed{display:none}
+.mic::before{content:"";width:8px;height:8px;border-radius:50%;background:#4cc38a}
+.mic.off::before{background:var(--dim)}
 
 /* ---------- review ---------- */
 .review{position:fixed;inset:0;z-index:20;background:var(--ink);display:flex;flex-direction:column;gap:12px;padding:calc(12px + env(safe-area-inset-top,0px)) 16px calc(16px + env(safe-area-inset-bottom,0px))}
@@ -113,7 +121,7 @@ input[type=range]{width:100%;accent-color:var(--amber);margin:0;height:28px}
     <textarea id="script" spellcheck="false" placeholder="把講稿貼在這裡。空一行代表換段。"></textarea>
     <div class="sheet-tools"><button class="chip" id="clear" type="button">清空</button></div>
   </div>
-  <p class="hint">空一行＝換段;<mark>**兩個星號**</mark> 包起來的字會標黃色。錄影時點上方字幕區＝暫停/繼續捲動(不會停錄),手指上下拖可以倒回。</p>
+  <p class="hint">空一行＝換段;<mark>**兩個星號**</mark> 包起來的字會標黃色。錄影時點上方字幕區＝暫停/繼續(不會停錄),手指上下拖可以倒回。</p>
   <p class="err" id="err" hidden></p>
 
   <section class="dials" aria-label="提詞設定">
@@ -122,7 +130,9 @@ input[type=range]{width:100%;accent-color:var(--amber);margin:0;height:28px}
     <div class="dial"><label for="panel">提詞區高度 <output id="panelOut"></output></label><input type="range" id="panel" min="25" max="70" step="1"></div>
     <div class="dial"><label for="guide">視線位置 <output id="guideOut"></output></label><input type="range" id="guide" min="10" max="60" step="1"></div>
     <div class="toggles">
+      <label class="toggle"><input type="checkbox" id="follow"> 跟著我的聲音捲動</label>
       <label class="toggle"><input type="checkbox" id="countdown"> 開錄前倒數 3 秒</label>
+      <p class="hint" id="followNote"></p>
     </div>
   </section>
 
@@ -136,7 +146,8 @@ input[type=range]{width:100%;accent-color:var(--amber);margin:0;height:28px}
       <div class="track" id="track"><div class="text" id="text"></div></div>
       <div class="fade" id="fade"></div>
       <div class="band" id="band"></div>
-      <div class="status"><span class="recdot" id="recTime">00:00</span><span id="clock"></span></div>
+      <div class="heard" id="heard"></div>
+      <div class="status"><span class="mic" id="mic"></span><span class="recdot" id="recTime">00:00</span><span id="clock"></span></div>
     </div>
   </div>
   <div class="count" id="count" hidden></div>
@@ -194,6 +205,7 @@ input[type=range]{width:100%;accent-color:var(--amber);margin:0;height:28px}
     panel: store.get('panel', 40),
     guide: store.get('guide', 22),
     countdown: store.get('countdown', true),
+    follow: store.get('follow', true),
     lh: 1.5,
   };
 
@@ -218,6 +230,14 @@ input[type=range]{width:100%;accent-color:var(--amber);margin:0;height:28px}
   }
   $('countdown').checked = S.countdown;
   $('countdown').addEventListener('change', () => { S.countdown = $('countdown').checked; store.set('countdown', S.countdown); });
+
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  $('follow').checked = S.follow && !!SR;
+  $('follow').disabled = !SR;
+  $('followNote').textContent = SR
+    ? '開「跟著聲音」時,字幕會停在你唸到的地方:你停它就停,跳著唸它也會跟過去。聲音會交給瀏覽器的語音辨識(通常是 Google 或 Apple)處理,只用來對位置,不會存下來。'
+    : '這個瀏覽器不支援語音辨識,只能用固定速度捲動。Android 請用 Chrome,iPhone 請用 Safari。';
+  $('follow').addEventListener('change', () => { S.follow = $('follow').checked; store.set('follow', S.follow); });
 
   function updateStats() {
     const n = charCount(script.value);
@@ -262,7 +282,7 @@ input[type=range]{width:100%;accent-color:var(--amber);margin:0;height:28px}
       return false;
     }
     cam.srcObject = stream;
-    try { await cam.play(); } catch {}
+    cam.play().catch(() => {});
     return true;
   }
   function closeCamera() {
@@ -277,7 +297,29 @@ input[type=range]{width:100%;accent-color:var(--amber);margin:0;height:28px}
   let wakeLock = null;
 
   const esc = s => s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
-  const toHTML = src => esc(src.trim()).split(/\n\s*\n/).map(p => '<p>' + p.replace(/\*\*(.+?)\*\*/gs, '<mark>$1</mark>') + '</p>').join('');
+  const isWord = ch => /[\p{L}\p{N}]/u.test(ch);
+  let norm = [], spans = [], tops = [];
+  // 每個字包一個 span,語音對到第幾個字就知道它在畫面上哪一行
+  function buildText(src) {
+    norm = [];
+    const chunk = str => {
+      let out = '';
+      for (const ch of str) {
+        if (isWord(ch)) { out += `<span data-k="${norm.length}">${esc(ch)}</span>`; norm.push(ch.toLowerCase()); }
+        else out += esc(ch);
+      }
+      return out;
+    };
+    text.innerHTML = src.trim().split(/\n\s*\n/).map(p => {
+      const parts = p.split('**');
+      return '<p>' + parts.map((part, i) => {
+        if (i % 2 === 0) return chunk(part);
+        if (i === parts.length - 1) return '**' + chunk(part);  // 沒配對的 **
+        return '<mark>' + chunk(part) + '</mark>';
+      }).join('') + '</p>';
+    }).join('');
+    spans = [...text.querySelectorAll('span[data-k]')];
+  }
 
   function layout() {
     const prog = textH ? y / textH : 0;
@@ -293,13 +335,14 @@ input[type=range]{width:100%;accent-color:var(--amber);margin:0;height:28px}
     $('band').style.height = lineH + 'px';
     $('fade').style.height = Math.max(0, guideY - lineH / 2) + 'px';
     textH = text.offsetHeight;
+    tops = spans.map(el => el.offsetTop);
     pps = chars ? (S.cpm / 60) * (textH / chars) : 0;
-    y = prog * textH;
+    y = following ? (targetY = posY(pos)) : prog * textH;
     paint();
   }
   function paint() {
     track.style.transform = `translateY(${-y}px)`;
-    $('clock').textContent = pps ? '稿剩 ' + mmss((textH - y) / pps) : '';
+    $('clock').textContent = following ? `剩 ${norm.length - pos} 字` : pps ? '稿剩 ' + mmss((textH - y) / pps) : '';
     $('speedOut').textContent = S.cpm + ' 字/分';
   }
   function frame(t) {
@@ -313,6 +356,114 @@ input[type=range]{width:100%;accent-color:var(--amber);margin:0;height:28px}
   }
   function scrollOn() { if (scrolling || !textH) return; if (y >= textH) y = 0; scrolling = true; last = performance.now(); raf = requestAnimationFrame(frame); }
   function scrollOff() { scrolling = false; cancelAnimationFrame(raf); }
+
+  /* ---------- follow voice ---------- */
+  let following = false, pos = 0, targetY = 0, fraf = 0, flast = 0;
+  let rec = null, recWanted = false, recFails = 0;
+  const posY = p => p >= tops.length ? textH : tops[p];
+
+  function setPos(p) {
+    p = Math.max(0, Math.min(norm.length, p));
+    if (p > pos) for (let k = pos; k < p; k++) spans[k].classList.add('r');
+    else for (let k = p; k < pos; k++) spans[k].classList.remove('r');
+    pos = p;
+    targetY = posY(p);
+    paint();
+  }
+  function posFromY(yy) {
+    let lo = 0, hi = tops.length;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (tops[m] < yy - 2) lo = m + 1; else hi = m; }
+    return lo;
+  }
+  function followFrame(t) {
+    if (!following) return;
+    const dt = Math.min(0.1, (t - flast) / 1000);
+    flast = t;
+    const d = targetY - y;
+    if (!drag && Math.abs(d) > 0.5) { y += d * Math.min(1, dt * 7); paint(); }
+    fraf = requestAnimationFrame(followFrame);
+  }
+
+  function lcs(a, b) {
+    let prev = new Array(b.length + 1).fill(0);
+    for (let i = 1; i <= a.length; i++) {
+      const cur = new Array(b.length + 1).fill(0);
+      for (let j = 1; j <= b.length; j++) cur[j] = a[i - 1] === b[j - 1] ? prev[j - 1] + 1 : Math.max(prev[j], cur[j - 1]);
+      prev = cur;
+    }
+    return prev[b.length];
+  }
+  // 拿剛聽到的最後幾個字,在目前位置附近的講稿裡找最像的地方
+  function onHeard(said) {
+    $('heard').textContent = said.slice(-16);
+    const tail = [...said].filter(isWord).map(c => c.toLowerCase()).slice(-10);
+    const L = tail.length;
+    if (L < 3) return;
+    let best = -1, bestScore = 0, bestDist = Infinity;
+    const lo = Math.max(1, pos - 40), hi = Math.min(norm.length, pos + 80);
+    for (let e = lo; e <= hi; e++) {
+      let sc = lcs(tail, norm.slice(Math.max(0, e - L - 3), e));
+      if (norm[e - 1] === tail[L - 1]) sc += 0.5;
+      const dist = Math.abs(e - pos);
+      if (sc > bestScore || (sc === bestScore && dist < bestDist)) { best = e; bestScore = sc; bestDist = dist; }
+    }
+    if (best < 0 || bestScore < Math.max(3, Math.ceil(L * 0.6))) return;
+    if (best < pos && bestScore < Math.ceil(L * 0.8)) return;  // 往回跳要更確定
+    setPos(best);
+  }
+
+  function setMic(on) {
+    $('mic').classList.toggle('off', !on);
+    $('mic').textContent = on ? '跟著聲音' : '聲音暫停';
+  }
+  function startListening() {
+    if (!SR || !following) return;
+    recWanted = true;
+    setMic(true);
+    if (rec) return;
+    const r = new SR();
+    rec = r;
+    r.lang = 'zh-TW';
+    r.continuous = true;
+    r.interimResults = true;
+    r.maxAlternatives = 1;
+    r.onresult = e => {
+      recFails = 0;
+      let t = '';
+      for (let i = 0; i < e.results.length; i++) t += e.results[i][0].transcript;
+      onHeard(t);
+    };
+    r.onerror = e => {
+      if (['not-allowed', 'service-not-allowed', 'audio-capture', 'language-not-supported'].includes(e.error)) voiceFailed(e.error);
+    };
+    r.onend = () => {
+      if (rec === r) rec = null;
+      if (recWanted && following && !stage.hidden && document.visibilityState === 'visible') {
+        if (++recFails > 20) { voiceFailed('一直斷線'); return; }
+        setTimeout(startListening, 200);
+      }
+    };
+    // 新版 Chrome 可以直接用錄影那條麥克風,不會跟錄影搶
+    const tr = stream?.getAudioTracks()[0];
+    try { tr ? r.start(tr) : r.start(); }
+    catch { try { r.start(); } catch { rec = null; } }
+  }
+  function stopListening(paused) {
+    recWanted = false;
+    const r = rec; rec = null;
+    try { r?.abort(); } catch {}
+    setMic(false);
+    if (!paused) $('heard').textContent = '';
+  }
+  function voiceFailed(why) {
+    stopListening();
+    following = false;
+    cancelAnimationFrame(fraf);
+    stage.classList.remove('following');
+    $('heard').textContent = '語音辨識打不開(' + why + '),改用固定速度捲動';
+    if (recording()) scrollOn();
+    paint();
+  }
 
   /* ---------- recording ---------- */
   let recorder = null, chunks = [], recStart = 0, recDur = 0, recTick = 0, blobUrl = null, lastFile = null;
@@ -342,7 +493,7 @@ input[type=range]{width:100%;accent-color:var(--amber);margin:0;height:28px}
     $('rec').setAttribute('aria-label', '停止錄影');
     $('recTime').textContent = '00:00';
     recTick = setInterval(() => { $('recTime').textContent = mmss((performance.now() - recStart) / 1000); }, 250);
-    scrollOn();
+    if (!following) scrollOn();
   }
   function stopRecording() {
     if (!recording()) return;
@@ -420,18 +571,27 @@ input[type=range]{width:100%;accent-color:var(--amber);margin:0;height:28px}
     $('open').textContent = '打開前鏡頭';
     updateStats();
     if (!ok) return;
-    text.innerHTML = toHTML(script.value);
-    y = 0; textH = 0;
+    buildText(script.value);
+    chars = norm.length;
+    y = 0; textH = 0; pos = 0; targetY = 0;
+    following = S.follow && !!SR;
+    stage.classList.toggle('following', following);
     $('editor').hidden = true;
     stage.hidden = false;
     lockScreen();
-    requestAnimationFrame(layout);
+    requestAnimationFrame(() => {
+      layout();
+      if (following) { flast = performance.now(); fraf = requestAnimationFrame(followFrame); startListening(); }
+    });
   });
 
   function toEditor() {
     cancelCount();
     if (recording()) stopRecording();
     scrollOff();
+    stopListening();
+    following = false;
+    cancelAnimationFrame(fraf);
     closeCamera();
     stage.hidden = true;
     $('review').hidden = true;
@@ -446,7 +606,8 @@ input[type=range]{width:100%;accent-color:var(--amber);margin:0;height:28px}
   $('retake').addEventListener('click', () => {
     $('playback').pause();
     $('review').hidden = true;
-    y = 0; paint();
+    y = 0;
+    if (following) setPos(0); else paint();
   });
   $('share').addEventListener('click', async () => {
     try { await navigator.share({ files: [lastFile] }); } catch {}
@@ -459,7 +620,7 @@ input[type=range]{width:100%;accent-color:var(--amber);margin:0;height:28px}
   $('faster').addEventListener('click', () => setSpeed(10));
   $('smaller').addEventListener('click', () => setSize(-2));
   $('bigger').addEventListener('click', () => setSize(2));
-  $('restart').addEventListener('click', () => { y = 0; paint(); });
+  $('restart').addEventListener('click', () => { y = 0; if (following) setPos(0); else paint(); });
 
   // 點字幕區＝暫停/繼續捲動;上下拖＝倒回或跳過(都不影響錄影)
   const prompt = $('prompt');
@@ -477,6 +638,12 @@ input[type=range]{width:100%;accent-color:var(--amber);margin:0;height:28px}
   const endDrag = e => {
     if (!drag || e.pointerId !== drag.id) return;
     const d = drag; drag = null;
+    if (following) {
+      if (d.moved) setPos(posFromY(y));
+      else if (recWanted) stopListening(true);
+      else startListening();
+      return;
+    }
     if (!d.moved) { scrolling ? scrollOff() : scrollOn(); return; }
     if (d.was) scrollOn();
   };
